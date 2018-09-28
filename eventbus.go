@@ -218,7 +218,14 @@ func (b *EventBus) handle(m eh.EventMatcher, h eh.EventHandler, consumer *cluste
 		select {
 		case msg, ok := <-consumer.Messages():
 			if ok {
-				b.handleMessage(m, h, consumer, msg)
+				if err := b.handleMessage(m, h, msg.Value); err == nil {
+					consumer.MarkOffset(msg, "")
+				} else {
+					select {
+					case b.errCh <- err.(Error):
+					default:
+					}
+				}
 			}
 		case ntf := <-consumer.Notifications():
 			if ntf.Type == cluster.RebalanceOK {
@@ -233,30 +240,22 @@ func (b *EventBus) handle(m eh.EventMatcher, h eh.EventHandler, consumer *cluste
 	}
 }
 
-func (b *EventBus) handleMessage(m eh.EventMatcher, h eh.EventHandler, consumer *cluster.Consumer, msg *sarama.ConsumerMessage) {
+func (b *EventBus) handleMessage(m eh.EventMatcher, h eh.EventHandler, rawData []byte) error {
 	// Manually decode the raw BSON event.
 	data := bson.Raw{
 		Kind: 3,
-		Data: msg.Value,
+		Data: rawData,
 	}
 	var e evt
 	if err := data.Unmarshal(&e); err != nil {
-		select {
-		case b.errCh <- Error{Err: errors.New("could not unmarshal event: " + err.Error())}:
-		default:
-		}
-		return
+		return Error{Err: errors.New("could not unmarshal event: " + err.Error())}
 	}
 
 	// Create an event of the correct type.
 	if data, err := eh.CreateEventData(e.EventType); err == nil {
 		// Manually decode the raw BSON event.
 		if err := e.RawData.Unmarshal(data); err != nil {
-			select {
-			case b.errCh <- Error{Err: errors.New("could not unmarshal event data: " + err.Error())}:
-			default:
-			}
-			return
+			return Error{Err: errors.New("could not unmarshal event data: " + err.Error())}
 		}
 
 		// Set concrete event and zero out the decoded event.
@@ -267,21 +266,15 @@ func (b *EventBus) handleMessage(m eh.EventMatcher, h eh.EventHandler, consumer 
 	event := event{evt: e}
 	ctx := eh.UnmarshalContext(e.Context)
 
-	if !m(event) {
-		consumer.MarkOffset(msg, "")
-		return
-	}
-
-	// Notify all observers about the event.
-	if err := h.HandleEvent(ctx, event); err != nil {
-		select {
-		case b.errCh <- Error{Err: fmt.Errorf("could not handle event (%s): %s", h.HandlerType(), err.Error()), Ctx: ctx, Event: event}:
-		default:
+	if m(event) {
+		// Notify all observers about the event.
+		if err := h.HandleEvent(ctx, event); err != nil {
+			return Error{Err: fmt.Errorf("could not handle event (%s): %s",
+				h.HandlerType(), err.Error()), Ctx: ctx, Event: event}
 		}
-		return
 	}
 
-	consumer.MarkOffset(msg, "")
+	return nil
 }
 
 // evt is the internal event used on the wire only.
